@@ -1,0 +1,8 @@
+squachsim
+squachsim-live
+out/
+.nvs/
+__pycache__/
+squachsim.png
+build/
+squachsim-tab5

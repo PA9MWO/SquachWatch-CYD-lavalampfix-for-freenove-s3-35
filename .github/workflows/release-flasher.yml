@@ -1,0 +1,1027 @@
+name: Build and release firmware
+
+# Push a tag like v1.2.0 to: build firmware for the release-ready
+# environments (cyd, cyd-ili9341, awok, plus the cyd-fast/
+# cyd-ili9341-fast 80MHz display-overclock variants the flasher's
+# "experimental overclock" checkbox targets -- cyd35 stays excluded, see
+# the build step below; cyd/cyd-ili9341 are the same physical 2.8"
+# board, just the two display drivers it might have shipped with; the
+# -fast pair is that same board again at a different display clock, not
+# more boards), create a
+# GitHub Release for that tag with each one's three raw PlatformIO
+# artifacts attached (bootloader/partitions/firmware — the human-facing
+# source of truth), then also merge each into one flashable image and
+# attach those plus per-board version-stamped manifests. The repo is
+# public now, so the web flasher itself is deployed straight to this
+# repo's own GitHub Pages site (github.io/SquachWatch-CYD) as part of
+# this same run — all three merged binaries and manifests are copied
+# alongside index.html there so the browser fetches them same-origin
+# (GitHub release assets don't send CORS headers, so the flasher page
+# can't fetch them directly from the Releases tab). index.html's board
+# picker swaps which manifest the install button targets.
+on:
+  push:
+    tags:
+      # v*.*.* is a real release: notes required, GitHub Release created.
+      - "v*.*.*"
+      # lab-* is a development build. Same firmware pipeline and the same
+      # Pages deploy, but no release notes and no public Release -- it exists
+      # so an unfinished feature can be flashed from a machine that is not
+      # the one it was built on. See the `is_lab` output below.
+      #
+      # NOTE: this trigger needs a "lab-*" tag policy on the github-pages
+      # environment, which by default allows only `master` and `v*`. Without
+      # it the run is rejected before it starts. The dispatch input below runs
+      # from master and needs no such change, so it is the working path today.
+      - "lab-*"
+  workflow_dispatch:
+    inputs:
+      lab:
+        description: "Lab build: publish any unlisted lab boards, skip notes and Release"
+        type: boolean
+        default: false
+      label:
+        description: "Lab build name, e.g. Anubis: what the flasher's ?lab=1 picker calls it (blank: the commit)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write   # create the GitHub Release
+  pages: write       # deploy the flasher site
+  id-token: write    # required by actions/deploy-pages
+
+# One run per tag at a time. The v1.7.7 push started this workflow twice in
+# the same second -- same commit, same tag, same event -- and the two raced:
+# the second built the whole thing and then failed creating a Release the
+# first had just created. Queued instead of cancelled, so the run that got
+# there first is the one that finishes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # And the run that comes second finds the Release already there and stops
+  # cleanly, before the four-minute build, rather than after it with a red X.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.chk.outputs.skip }}
+    steps:
+      - name: Stop if this tag is already released
+        id: chk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "${{ github.ref_name }}" in
+            v*)
+              if gh release view "${{ github.ref_name }}" -R "${{ github.repository }}" >/dev/null 2>&1; then
+                echo "::notice::${{ github.ref_name }} is already released; nothing to do."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi ;;
+          esac
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+  # The RockBase NM-CYD-C5 (ESP32-C5, PR #21) builds in a runner of its own.
+  # Its platform is pioarduino (Arduino 3.3 / IDF 5.5), whose installer puts
+  # a core of its own into whatever Python it runs in -- on a Windows bench it
+  # left `pio` unable to start for every other board (2026-10-02). So it never
+  # shares a runner with the Xtensa builds; it hands its four files over as
+  # an artifact. Allowed to fail: a release is never held up by the one board
+  # most people do not have, and the main job attaches what it gets.
+  build-c5:
+    needs: preflight
+    if: needs.preflight.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"   # pioarduino refuses newer (3.15 broke the C5 runner, 2026-10-20)
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+      - name: Build RockBase NM-CYD-C5 (ESP32-C5)
+        run: pio run -e nm-cyd-c5
+      # The Marauder V8 (ESP32-C5, 8 MB) on the same runner and platform. Its
+      # own step can fail without taking the NM-CYD-C5 with it.
+      - name: Build Marauder V8 (ESP32-C5)
+        continue-on-error: true
+        run: pio run -e marauder-v8
+      # The M5Stack Tab5 (ESP32-P4) on the same platform. LAB ONLY: offered
+      # under ?lab=1, never on the public page or attached to a release. Its
+      # radio is an ESP32-C6 that needs our own firmware written to it first
+      # (docs/TAB5.md); a stock Tab5 runs this build with WiFi and Bluetooth
+      # off. Its own step, so a failure here never costs the C5 boards.
+      - name: Build M5Stack Tab5 (ESP32-P4)
+        continue-on-error: true
+        run: pio run -e tab5
+      - name: Collect
+        run: |
+          mkdir -p c5
+          cp .pio/build/nm-cyd-c5/bootloader.bin .pio/build/nm-cyd-c5/partitions.bin .pio/build/nm-cyd-c5/firmware.bin c5/
+          # The V8's bootloader and table are its own (DIO, 8 MB, 3.5 MB
+          # slots), named for it so they never mix with the NM-CYD-C5's.
+          if [ -f .pio/build/marauder-v8/firmware.bin ]; then
+            for f in bootloader partitions firmware; do cp ".pio/build/marauder-v8/$f.bin" "c5/marauder-v8-$f.bin"; done
+          fi
+          # boot_app0 lives in the framework the C5 was built with, not the
+          # Xtensa boards' one.
+          cp "$(find ~/.platformio/packages -path '*framework-arduinoespressif32*/tools/partitions/boot_app0.bin' | head -1)" c5/boot_app0.bin
+          # The Tab5: bootloader at 0x2000 like the C5, the 16 MB table, and
+          # the same framework's boot_app0 under its own name, so its lab
+          # manifest never depends on a C5 build having come through.
+          if [ -f .pio/build/tab5/firmware.bin ]; then
+            for f in bootloader partitions firmware; do cp ".pio/build/tab5/$f.bin" "c5/tab5-$f.bin"; done
+            cp c5/boot_app0.bin c5/tab5-boot_app0.bin
+          fi
+          ls -l c5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nm-cyd-c5
+          path: c5/
+          retention-days: 7
+
+  build-and-release:
+    needs: [preflight, build-c5]
+    if: needs.preflight.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.lab }}" = "true" ]; then
+            # A manual lab run has no tag -- REF_NAME is the branch. Stamping
+            # the manifests "master" would put that in the flasher's version
+            # line, so lab builds are stamped with the commit they came from,
+            # which is the only thing that identifies one.
+            LABEL="$(echo "${{ inputs.label }}" | tr -cd 'A-Za-z0-9-' | tr 'A-Z' 'a-z')"
+            if [ -n "$LABEL" ]; then
+              echo "version=lab-$LABEL" >> "$GITHUB_OUTPUT"
+              echo "label=${{ inputs.label }}" >> "$GITHUB_OUTPUT"
+            else
+              echo "version=lab-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+              echo "label=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          fi
+          # Everything downstream keys off this rather than re-testing the
+          # tag shape, so there is one definition of what a lab build is.
+          # Either a lab-* tag, or a manual run with the lab box ticked. The
+          # dispatch path exists because the github-pages environment only
+          # permits deploys from master and v* -- a lab-* tag is rejected
+          # before the job starts unless that policy is widened.
+          if [ "${{ inputs.lab }}" = "true" ]; then
+            echo "is_lab=true" >> "$GITHUB_OUTPUT"
+          else
+            case "$TAG" in
+              lab-*) echo "is_lab=true"  >> "$GITHUB_OUTPUT" ;;
+              *)     echo "is_lab=false" >> "$GITHUB_OUTPUT" ;;
+            esac
+          fi
+
+      - name: Require release notes
+        # Skipped for lab builds, which are not releases and have no notes to
+        # write. The gate itself is NOT relaxed for real tags: it exists
+        # because v1.5.5 and v1.5.6 both shipped with an auto-generated body
+        # containing nothing but a changelog link.
+        if: steps.ver.outputs.is_lab != 'true'
+        # Fails in seconds, before the ~4 minute firmware build, because a
+        # release with no notes is not a finished release and finding that
+        # out afterwards means the tag is already public.
+        #
+        # This used to fall back to --generate-notes when the file was
+        # missing. That fallback summarises merged pull requests, and this
+        # repo commits straight to master -- so it had nothing to work with
+        # and produced a body containing only a changelog link. v1.5.5 and
+        # v1.5.6 both shipped that way before anyone noticed.
+        run: |
+          NOTES_FILE=".github/release-notes/${{ steps.ver.outputs.tag }}.md"
+          if [ ! -s "$NOTES_FILE" ]; then
+            echo "::error::No release notes for ${{ steps.ver.outputs.tag }}."
+            echo ""
+            echo "Create $NOTES_FILE, commit it, then re-run this workflow"
+            echo "(or delete and re-push the tag)."
+            echo ""
+            echo "Recent notes to copy the house style from:"
+            ls .github/release-notes/ | tail -5
+            exit 1
+          fi
+          echo "Using $NOTES_FILE ($(wc -l < "$NOTES_FILE") lines)"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"   # pioarduino refuses newer (3.15 broke the C5 runner, 2026-10-20)
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware
+        # cyd35-fast (the 3.5" ST7796) ships from v1.16.0 as a BETA, and
+        # only at 80 MHz: the plain cyd35 at 40 MHz halves the frame rate on
+        # a board that needs every frame it can get, so there is no slow
+        # build to offer and the flasher's overclock box is disabled for it.
+        # That board's boot screen says BETA on it, every boot.
+        run: |
+          # rlphantom-r is the RL Phantom 2.4" (Sunton ESP32-2432S024R), the
+          # resistive-touch version, confirmed on real boards.
+          # freenove32 is the Freenove 3.2" (FNK0103L): the RL Phantom
+          # resistive's pins with an ST7789, confirmed on a real board.
+          # cyd32c is the Sunton ESP32-2432S032C: the Freenove 3.2"'s screen with
+          # a GT911 capacitive panel, confirmed on a real board (issue #6).
+          pio run -e cyd -e cyd-ili9341 -e awok -e rlphantom-r -e freenove32 -e cyd32c -e cyd-fast -e cyd-ili9341-fast -e cyd35-fast -e cyd35c-fast
+          # twatch-s3 is the LilyGo T-Watch S3: an ESP32-S3, so its own
+          # bootloader (at 0x0, not 0x1000) and its own 16 MB partition
+          # table. A lab board until the watch work settles; see ?lab=1.
+          # freenove-s3 (Freenove ESP32-S3 2.8", FNK0104B) and crowpanel7
+          # (Elecrow CrowPanel Advance 7.0) are S3s too, public BETAs from
+          # v1.24.0, contributed and tested on their authors' boards (#16, #11).
+          # freenove-s3-40mhz is the same 2.8" at a 40 MHz screen wire, for the
+          # panels that tear at 80 (#65, #14); the flasher offers it by unticking
+          # 80 MHz under Advanced on the 2.8"'s row. A public BETA from v1.40.0.
+          # freenove-s3-35 is the black Freenove ESP32-S3 3.5" (FNK0104N), a
+          # public BETA from v1.34.0: the 2.8"'s flash layout, its own QSPI panel.
+          # tdeck-plus is the LilyGo T-Deck Plus: the same S3, flash layout and
+          # bootloader as the watch, a public BETA from v1.36.0.
+          pio run -e twatch-s3 -e freenove-s3 -e freenove-s3-40mhz -e freenove-s3-35 -e crowpanel7 -e tdeck-plus
+          # sticks3 is the M5Stack StickS3: an S3 with 8 MB of flash, so the
+          # CYDs' partition table behind an S3 bootloader of its own. LAB ONLY:
+          # built and signed every run, offered under ?lab=1, never attached
+          # to a release or listed on the public page.
+          pio run -e sticks3
+          # cardputer-adv is the M5Stack Cardputer ADV: the StickS3's screen
+          # and layouts with a keyboard, 8 MB and no PSRAM. LAB ONLY, the same
+          # way, with its own bootloader and table.
+          pio run -e cardputer-adv
+          # The Phantom's capacitive version has never run on a real board, so
+          # it is compiled to keep its code honest but NOT published anywhere.
+          pio run -e rlphantom
+
+      - name: Fetch the NM-CYD-C5 build
+        # Only if its runner managed one (see build-c5). The C5 shares no
+        # file with the other boards: the bootloader sits at 0x2000 on this
+        # chip, there is a boot_app0 at 0xe000, and the flash is 16 MB. It is
+        # on the flasher page as a BETA -- the browser library lists the C5
+        # but nobody here has watched it flash one, and a BETA is how this
+        # project finds that out.
+        if: needs.build-c5.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: nm-cyd-c5
+          path: c5
+
+      - name: Merge into one flashable image (per board)
+        run: |
+          pip install esptool
+          if [ -f c5/firmware.bin ]; then
+            # Four parts and NO merged image for this board, on purpose: a
+            # merged image starts at 0x0 and so covers 0x9000-0xe000, which
+            # is NVS, and flashing it wipes every setting on the board. The
+            # four-part esptool command is in docs/NM-CYD-C5.md.
+            cp c5/firmware.bin   nm-cyd-c5-firmware.bin
+            cp c5/bootloader.bin esp32c5-bootloader.bin
+            cp c5/partitions.bin nm-cyd-c5-partitions.bin
+            cp c5/boot_app0.bin  esp32c5-boot_app0.bin
+          else
+            echo "::warning::No NM-CYD-C5 build this run; the release goes out without it."
+          fi
+          # The Marauder V8, four parts like the NM-CYD-C5 and for the same
+          # reason; boot_app0 is the C5's one, shared.
+          if [ -f c5/marauder-v8-firmware.bin ]; then
+            cp c5/marauder-v8-firmware.bin c5/marauder-v8-bootloader.bin c5/marauder-v8-partitions.bin .
+            cp c5/boot_app0.bin esp32c5-boot_app0.bin
+          else
+            echo "::warning::No Marauder V8 build this run; the release goes out without it."
+          fi
+          # The Tab5, lab only: its four files, for the lab list below.
+          if [ -f c5/tab5-firmware.bin ]; then
+            cp c5/tab5-firmware.bin c5/tab5-bootloader.bin c5/tab5-partitions.bin c5/tab5-boot_app0.bin .
+          else
+            echo "::warning::No Tab5 build this run; it is not in the lab list."
+          fi
+          python -m esptool --chip esp32 merge_bin \
+            -o firmware-cyd-merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000  .pio/build/cyd/bootloader.bin \
+            0x8000  .pio/build/cyd/partitions.bin \
+            0x10000 .pio/build/cyd/firmware.bin
+          python -m esptool --chip esp32 merge_bin \
+            -o firmware-cyd-ili9341-merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000  .pio/build/cyd-ili9341/bootloader.bin \
+            0x8000  .pio/build/cyd-ili9341/partitions.bin \
+            0x10000 .pio/build/cyd-ili9341/firmware.bin
+          python -m esptool --chip esp32 merge_bin \
+            -o firmware-awok-merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000  .pio/build/awok/bootloader.bin \
+            0x8000  .pio/build/awok/partitions.bin \
+            0x10000 .pio/build/awok/firmware.bin
+          python -m esptool --chip esp32 merge_bin \
+            -o firmware-rlphantom-r-merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000  .pio/build/rlphantom-r/bootloader.bin \
+            0x8000  .pio/build/rlphantom-r/partitions.bin \
+            0x10000 .pio/build/rlphantom-r/firmware.bin
+          python -m esptool --chip esp32 merge_bin \
+            -o firmware-freenove32-merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000  .pio/build/freenove32/bootloader.bin \
+            0x8000  .pio/build/freenove32/partitions.bin \
+            0x10000 .pio/build/freenove32/firmware.bin
+          python -m esptool --chip esp32 merge_bin \
+            -o firmware-cyd32c-merged.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000  .pio/build/cyd32c/bootloader.bin \
+            0x8000  .pio/build/cyd32c/partitions.bin \
+            0x10000 .pio/build/cyd32c/firmware.bin
+          python -m esptool --chip esp32s3 merge_bin \
+            -o firmware-twatch-s3-merged.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            0x0     .pio/build/twatch-s3/bootloader.bin \
+            0x8000  .pio/build/twatch-s3/partitions.bin \
+            0xe000  "$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin" \
+            0x10000 .pio/build/twatch-s3/firmware.bin
+          for v in freenove-s3 freenove-s3-40mhz freenove-s3-35 crowpanel7 tdeck-plus; do
+            python -m esptool --chip esp32s3 merge_bin \
+              -o "firmware-$v-merged.bin" \
+              --flash_mode dio --flash_freq 80m --flash_size 16MB \
+              0x0     ".pio/build/$v/bootloader.bin" \
+              0x8000  ".pio/build/$v/partitions.bin" \
+              0xe000  "$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin" \
+              0x10000 ".pio/build/$v/firmware.bin"
+          done
+          # The two M5Stack boards: 8 MB, each with its own bootloader and the
+          # CYDs' two-slot table.
+          for v in sticks3 cardputer-adv; do
+            python -m esptool --chip esp32s3 merge_bin \
+              -o "firmware-$v-merged.bin" \
+              --flash_mode dio --flash_freq 80m --flash_size 8MB \
+              0x0     ".pio/build/$v/bootloader.bin" \
+              0x8000  ".pio/build/$v/partitions.bin" \
+              0xe000  "$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin" \
+              0x10000 ".pio/build/$v/firmware.bin"
+          done
+          # Every board's raw PlatformIO artifacts share the same basenames
+          # (bootloader.bin/partitions.bin/firmware.bin), and release assets
+          # need unique names -- the very first two-board release failed
+          # partway through uploading when the second partitions.bin
+          # collided with the first. The firmware is board-prefixed below.
+          #
+          # The bootloader and the partition table are NOT. All five builds
+          # produce them byte for byte identical: they depend on the chip,
+          # the partition CSV and the flash mode/size, and every environment
+          # shares all of those. Only the display driver header and the pin
+          # map differ, and both live entirely in the app. Five copies of
+          # two identical files was eight redundant assets on the release
+          # and eight more on the Pages site, every one of them fetched
+          # over the wire by somebody.
+          #
+          # That identity is a property of today's configuration, not a
+          # guarantee, so it is checked rather than assumed. Add a board
+          # with a different flash size or partition table and this fails
+          # loudly right here, which is far better than shipping it: a
+          # mismatched bootloader does not report an error, it produces a
+          # board that looks bricked.
+          for f in bootloader partitions; do
+            ref="$(sha256sum ".pio/build/cyd/$f.bin" | cut -d' ' -f1)"
+            for v in cyd cyd-ili9341 awok rlphantom-r freenove32 cyd32c cyd-fast cyd-ili9341-fast cyd35-fast cyd35c-fast; do
+              got="$(sha256sum ".pio/build/$v/$f.bin" | cut -d' ' -f1)"
+              if [ "$got" != "$ref" ]; then
+                echo "::error::$v/$f.bin differs from cyd/$f.bin."
+                echo "These ship as one shared esp32-$f.bin, which is only"
+                echo "valid while every environment produces the same file."
+                echo "Give that board its own copy, or work out why it"
+                echo "diverged, before releasing this."
+                exit 1
+              fi
+            done
+            cp ".pio/build/cyd/$f.bin" "esp32-$f.bin"
+            echo "esp32-$f.bin is identical across all six builds ($ref)"
+          done
+          # The OTA data partition (0xE000), written blank-but-valid on every
+          # USB install. Without it, a board that has taken a Bluetooth update
+          # keeps booting the slot that update went into, and a USB install --
+          # which always writes app0 -- would be silently ignored. It is the
+          # same boot_app0.bin `pio run -t upload` has always written.
+          cp "$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin" esp32-otadata.bin
+          test "$(stat -c%s esp32-otadata.bin)" -eq 8192
+          # The S3 watch shares none of that: its own chip, its own bootloader
+          # and its own table. otadata is the same eight bytes of boot_app0.
+          cp .pio/build/twatch-s3/bootloader.bin esp32s3-bootloader.bin
+          cp .pio/build/twatch-s3/partitions.bin twatch-s3-partitions.bin
+          # The StickS3 shares neither: 8 MB in the bootloader's header, and
+          # the two-slot 4 MB table.
+          cp .pio/build/sticks3/bootloader.bin sticks3-bootloader.bin
+          cp .pio/build/sticks3/partitions.bin sticks3-partitions.bin
+          cp .pio/build/cardputer-adv/bootloader.bin cardputer-adv-bootloader.bin
+          cp .pio/build/cardputer-adv/partitions.bin cardputer-adv-partitions.bin
+          # The other two S3 boards share both: the same flash mode, size and
+          # speed, and partition tables with the same rows. Checked, not
+          # assumed, for the same reason as the ESP32 pair above.
+          for f in bootloader partitions; do
+            ref="$(sha256sum ".pio/build/twatch-s3/$f.bin" | cut -d' ' -f1)"
+            for v in freenove-s3 freenove-s3-40mhz freenove-s3-35 crowpanel7 tdeck-plus; do
+              got="$(sha256sum ".pio/build/$v/$f.bin" | cut -d' ' -f1)"
+              if [ "$got" != "$ref" ]; then
+                echo "::error::$v/$f.bin differs from twatch-s3/$f.bin, which the S3 manifests share."
+                exit 1
+              fi
+            done
+          done
+          # The app, which is the only part that actually differs. cyd-fast
+          # and cyd-ili9341-fast are the 80MHz display-overclock variants
+          # the flasher's "experimental overclock" checkbox targets,
+          # identical to their base build apart from -DSPI_FREQUENCY. No
+          # merged image for those on purpose: the merged blob is a
+          # manual-recovery artifact, and recovery should land you on the
+          # spec-compliant build rather than the overclocked one.
+          for v in cyd cyd-ili9341 awok rlphantom-r freenove32 cyd32c cyd-fast cyd-ili9341-fast cyd35-fast cyd35c-fast twatch-s3 freenove-s3 freenove-s3-40mhz freenove-s3-35 crowpanel7 tdeck-plus sticks3 cardputer-adv; do
+            cp ".pio/build/$v/firmware.bin" "$v-firmware.bin"
+          done
+
+      - name: Sign firmware for Bluetooth updates
+        # Each board checks an update against the public key compiled into
+        # include/ota_pubkey.h, over a message that includes its own build
+        # name -- see tools/sign_firmware.py. No secret, no signatures: the
+        # release still ships, and the update page tells people to use USB.
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+        run: |
+          if [ -z "$OTA_SIGNING_KEY" ]; then
+            echo "::warning::OTA_SIGNING_KEY is not set; this release cannot be installed over Bluetooth."
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$OTA_SIGNING_KEY" > "$RUNNER_TEMP/ota_key.pem"
+          for v in cyd cyd-ili9341 awok rlphantom-r freenove32 cyd32c cyd-fast cyd-ili9341-fast cyd35-fast cyd35c-fast twatch-s3 freenove-s3 freenove-s3-40mhz freenove-s3-35 crowpanel7 tdeck-plus sticks3 cardputer-adv; do
+            python tools/sign_firmware.py --key "$RUNNER_TEMP/ota_key.pem" \
+              --env "$v" --bin "$v-firmware.bin" --out "$v-firmware.sig"
+          done
+          rm -f "$RUNNER_TEMP/ota_key.pem"
+
+      - name: Stamp manifest versions
+        run: |
+          python - <<'PY'
+          import json, os, re
+          # The release's name and its lines for a board's own screen. The
+          # name is the one the Release title already uses; the lines come
+          # from an optional
+          #     <!-- board: first line | second | third -->
+          # in the notes file, written for a 33-character panel rather than
+          # cut out of the prose. SYSTEM PROPERTIES shows them after the
+          # board finds this release; ESP Web Tools ignores keys it does not
+          # know, so the browser flasher reads the file exactly as before.
+          name, news = "", []
+          nf = os.path.join(".github", "release-notes", "${{ steps.ver.outputs.tag }}.md")
+          if os.path.exists(nf):
+              head = open(nf, encoding="utf-8").read(4096)
+              m = re.search(r"<!--\s*name:\s*(.+?)\s*-->", head)
+              if m: name = m.group(1)[:19]
+              m = re.search(r"<!--\s*board:\s*(.+?)\s*-->", head)
+              if m: news = [x.strip()[:38] for x in m.group(1).split("|") if x.strip()][:4]
+          print("manifest: name %r, %d line(s)" % (name, len(news)))
+          for p in ("web-flasher/manifest-cyd.json", "web-flasher/manifest-cyd-ili9341.json",
+                    "web-flasher/manifest-awok.json", "web-flasher/manifest-cyd-fast.json",
+                    "web-flasher/manifest-cyd-ili9341-fast.json",
+                    "web-flasher/manifest-rlphantom-r.json",
+                    "web-flasher/manifest-freenove32.json",
+                    "web-flasher/manifest-cyd32c.json",
+                    "web-flasher/manifest-cyd35-fast.json",
+                    "web-flasher/manifest-cyd35c-fast.json",
+                    "web-flasher/manifest-twatch-s3.json",
+                    "web-flasher/manifest-freenove-s3.json",
+                    "web-flasher/manifest-freenove-s3-40mhz.json",
+                    "web-flasher/manifest-freenove-s3-35.json",
+                    "web-flasher/manifest-crowpanel7.json",
+                    "web-flasher/manifest-sticks3.json",
+                    "web-flasher/manifest-cardputer-adv.json",
+                    "web-flasher/manifest-nm-cyd-c5.json",
+                    "web-flasher/manifest-marauder-v8.json",
+                    "web-flasher/manifest-tdeck-plus.json"):
+              m = json.load(open(p))
+              m["version"] = "${{ steps.ver.outputs.version }}"
+              if name: m["release_name"] = name
+              else:    m.pop("release_name", None)
+              if news: m["whats_new"] = news
+              else:    m.pop("whats_new", None)
+              json.dump(m, open(p, "w"), indent=2)
+          PY
+          # These are attached to the release as well, and they are not
+          # redundant with the Pages copies even though the flasher only
+          # ever loads the Pages ones. "Keep the previous two releases
+          # flashable" downloads each OLD release's manifest and drops it
+          # into that release's own directory, where its relative paths
+          # resolve against that release's binaries with no rewriting.
+          # Stop attaching them and every release silently falls out of the
+          # version picker one tag after it ships.
+          cp web-flasher/manifest-cyd.json manifest-cyd.json
+          cp web-flasher/manifest-cyd-ili9341.json manifest-cyd-ili9341.json
+          cp web-flasher/manifest-awok.json manifest-awok.json
+          cp web-flasher/manifest-cyd-fast.json manifest-cyd-fast.json
+          cp web-flasher/manifest-cyd-ili9341-fast.json manifest-cyd-ili9341-fast.json
+          cp web-flasher/manifest-rlphantom-r.json manifest-rlphantom-r.json
+          cp web-flasher/manifest-freenove32.json manifest-freenove32.json
+          cp web-flasher/manifest-cyd32c.json manifest-cyd32c.json
+          cp web-flasher/manifest-cyd35-fast.json manifest-cyd35-fast.json
+          cp web-flasher/manifest-cyd35c-fast.json manifest-cyd35c-fast.json
+          cp web-flasher/manifest-twatch-s3.json manifest-twatch-s3.json
+          cp web-flasher/manifest-freenove-s3.json manifest-freenove-s3.json
+          cp web-flasher/manifest-freenove-s3-40mhz.json manifest-freenove-s3-40mhz.json
+          cp web-flasher/manifest-freenove-s3-35.json manifest-freenove-s3-35.json
+          cp web-flasher/manifest-crowpanel7.json manifest-crowpanel7.json
+          cp web-flasher/manifest-tdeck-plus.json manifest-tdeck-plus.json
+          cp web-flasher/manifest-sticks3.json manifest-sticks3.json
+          cp web-flasher/manifest-cardputer-adv.json manifest-cardputer-adv.json
+
+      - name: Create GitHub Release with build artifacts
+        # A lab tag publishes a flashable build and nothing else. Creating a
+        # Release for one would put an unfinished feature in the download list
+        # next to the real firmware, which is the opposite of unlisted.
+        if: steps.ver.outputs.is_lab != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Existence was already checked before the build, so there is
+          # no fallback here -- the fallback is what let two releases
+          # ship with an empty body.
+          # A release can carry a name: the notes file's first line, as an
+          # HTML comment GitHub does not render, e.g. <!-- name: Anubis -->.
+          NAME="$(sed -n '1s/^<!-- name: \(.*\) -->$/\1/p' ".github/release-notes/${{ steps.ver.outputs.tag }}.md")"
+          TITLE="SquachWatch-CYD ${{ steps.ver.outputs.tag }}"
+          if [ -n "$NAME" ]; then TITLE="$TITLE \"$NAME\""; fi
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            --title "$TITLE" \
+            --notes-file ".github/release-notes/${{ steps.ver.outputs.tag }}.md" \
+            esp32-bootloader.bin \
+            esp32-partitions.bin \
+            esp32-otadata.bin \
+            cyd-firmware.bin \
+            cyd-ili9341-firmware.bin \
+            awok-firmware.bin \
+            rlphantom-r-firmware.bin \
+            freenove32-firmware.bin \
+            cyd32c-firmware.bin \
+            cyd-fast-firmware.bin \
+            cyd-ili9341-fast-firmware.bin \
+            cyd35-fast-firmware.bin \
+            cyd35c-fast-firmware.bin \
+            esp32s3-bootloader.bin \
+            twatch-s3-partitions.bin \
+            twatch-s3-firmware.bin \
+            firmware-twatch-s3-merged.bin \
+            manifest-twatch-s3.json \
+            freenove-s3-firmware.bin \
+            firmware-freenove-s3-merged.bin \
+            manifest-freenove-s3.json \
+            freenove-s3-40mhz-firmware.bin \
+            firmware-freenove-s3-40mhz-merged.bin \
+            manifest-freenove-s3-40mhz.json \
+            freenove-s3-35-firmware.bin \
+            firmware-freenove-s3-35-merged.bin \
+            manifest-freenove-s3-35.json \
+            crowpanel7-firmware.bin \
+            firmware-crowpanel7-merged.bin \
+            manifest-crowpanel7.json \
+            tdeck-plus-firmware.bin \
+            firmware-tdeck-plus-merged.bin \
+            manifest-tdeck-plus.json \
+            sticks3-bootloader.bin \
+            sticks3-partitions.bin \
+            sticks3-firmware.bin \
+            firmware-sticks3-merged.bin \
+            manifest-sticks3.json \
+            cardputer-adv-bootloader.bin \
+            cardputer-adv-partitions.bin \
+            cardputer-adv-firmware.bin \
+            firmware-cardputer-adv-merged.bin \
+            manifest-cardputer-adv.json \
+            firmware-cyd-merged.bin \
+            firmware-cyd-ili9341-merged.bin \
+            firmware-awok-merged.bin \
+            firmware-rlphantom-r-merged.bin \
+            firmware-freenove32-merged.bin \
+            firmware-cyd32c-merged.bin \
+            manifest-cyd.json \
+            manifest-cyd-ili9341.json \
+            manifest-awok.json \
+            manifest-rlphantom-r.json \
+            manifest-freenove32.json \
+            manifest-cyd32c.json \
+            manifest-cyd-fast.json \
+            manifest-cyd-ili9341-fast.json \
+            manifest-cyd35-fast.json \
+            manifest-cyd35c-fast.json \
+            $(ls nm-cyd-c5-*.bin esp32c5-*.bin 2>/dev/null) \
+            $([ -f nm-cyd-c5-firmware.bin ] && cp web-flasher/manifest-nm-cyd-c5.json manifest-nm-cyd-c5.json && echo manifest-nm-cyd-c5.json)             $(ls marauder-v8-*.bin 2>/dev/null)             $([ -f marauder-v8-firmware.bin ] && cp web-flasher/manifest-marauder-v8.json manifest-marauder-v8.json && echo manifest-marauder-v8.json) \
+            $(ls *-firmware.sig 2>/dev/null)
+
+      - name: Build the browser emulator
+        # On a lab run too: a lab run serves the RELEASED emulator, and the
+        # only honest way to have one is to build it from the release tag's
+        # sources (next step). See the Pages step for why.
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          # Matched to the toolchain the working emulator was built with
+          # locally. Pinned rather than "latest": a compiler bump that changes
+          # the output is a thing to do deliberately and check, not something
+          # to discover because the public page stopped loading.
+          version: 6.0.9
+          actions-cache-folder: emsdk-cache
+
+      - name: Compile the emulator to WebAssembly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          em++ --version | head -1
+          if [ "${{ steps.ver.outputs.is_lab }}" = "true" ]; then
+            # A lab run builds the LATEST RELEASE's emulator, from that tag's
+            # own tree, into released-emulator/ for the Pages step. It used
+            # to copy the files committed in web-flasher/emulator/ instead,
+            # and nobody refreshed those after v1.12.0: every lab run after a
+            # release put an emulator built from v1.7-era sources back on the
+            # public page, over the release's fresh one (seen 2026-11-07, with
+            # v1.40.0 out and the site's emulator still v1.7).
+            LATEST="$(gh release list --limit 1 --json tagName -q '.[0].tagName')"
+            git fetch --depth=1 origin "refs/tags/$LATEST:refs/tags/$LATEST"
+            git worktree add --detach /tmp/released "$LATEST"
+            make -C /tmp/released/sim wasm WASM_VERSION="$LATEST"
+            mkdir -p released-emulator
+            cp /tmp/released/web-flasher/emulator/index.html released-emulator/index.html
+            cp /tmp/released/sim/web/squachsim.js /tmp/released/sim/web/squachsim.wasm released-emulator/
+            # The boards' own builds (T-Deck, watch, Cardputer), from the
+            # release that first has each. Without one, the page runs the CYD
+            # build at that board's size.
+            for b in tdeck twatch cardputer; do
+              if grep -q "^wasm-$b:" /tmp/released/sim/Makefile; then
+                make -C /tmp/released/sim "wasm-$b" WASM_VERSION="$LATEST"
+                cp "/tmp/released/sim/web/squachsim-$b.js" "/tmp/released/sim/web/squachsim-$b.wasm" released-emulator/
+              fi
+            done
+            OUT=released-emulator
+          else
+            make -C sim wasm-all WASM_VERSION="v${{ steps.ver.outputs.version }}"
+            for b in tdeck twatch cardputer; do
+              test "$(stat -c%s "sim/web/squachsim-$b.wasm")" -gt 200000
+            done
+            OUT=sim/web
+          fi
+          ls -l "$OUT/squachsim.js" "$OUT/squachsim.wasm"
+          # An empty or tiny output means the link quietly failed; the site
+          # would then serve a page that loads nothing and sits there blank.
+          test -s "$OUT/squachsim.wasm"
+          test "$(stat -c%s "$OUT/squachsim.wasm")" -gt 200000
+
+      - name: Assemble Pages site
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The flasher ships each board's three raw regions rather than
+        # the single merged image, and the manifests place them at their
+        # real offsets (0x1000/0x8000/0x10000). That matters: `esptool
+        # merge_bin` pads the gaps between those regions with 0xFF, and
+        # the gap between the partition table and the app is exactly
+        # where NVS lives (0x9000, 20K). Flashing the merged blob at
+        # offset 0 therefore wrote 20KB of 0xFF straight over saved
+        # settings -- confirmed against the shipped v1.4.1 image, where
+        # all 20480 bytes of that range are 0xFF -- so every web-flasher
+        # update silently factory-reset the device. Writing the three
+        # regions separately never touches 0x9000, which is what
+        # `pio run -t upload` has always done.
+        #
+        # The merged images are still built and attached to the release
+        # for manual `esptool write_flash 0x0` use; they just aren't what
+        # the flasher page serves. Note they still wipe NVS by the same
+        # mechanism, which for a deliberate full-image write is the
+        # expected "start clean" behaviour.
+        run: |
+          mkdir -p _site
+          cp web-flasher/index.html _site/index.html
+          # next.html, the three-step layout, became index.html on 2026-10-11. A
+          # page put there again for review is served the same way.
+          if [ -f web-flasher/next.html ]; then cp web-flasher/next.html _site/next.html; fi
+          cp web-flasher/manifest-cyd.json _site/manifest-cyd.json
+          cp web-flasher/manifest-cyd-ili9341.json _site/manifest-cyd-ili9341.json
+          cp web-flasher/manifest-awok.json _site/manifest-awok.json
+          cp web-flasher/manifest-cyd-fast.json _site/manifest-cyd-fast.json
+          cp web-flasher/manifest-cyd-ili9341-fast.json _site/manifest-cyd-ili9341-fast.json
+          cp web-flasher/manifest-rlphantom-r.json _site/manifest-rlphantom-r.json
+          cp web-flasher/manifest-freenove32.json _site/manifest-freenove32.json
+          cp web-flasher/manifest-cyd32c.json _site/manifest-cyd32c.json
+          cp web-flasher/manifest-cyd35-fast.json _site/manifest-cyd35-fast.json
+          cp web-flasher/manifest-cyd35c-fast.json _site/manifest-cyd35c-fast.json
+          cp web-flasher/manifest-twatch-s3.json _site/manifest-twatch-s3.json
+          cp web-flasher/manifest-freenove-s3.json _site/manifest-freenove-s3.json
+          cp web-flasher/manifest-freenove-s3-40mhz.json _site/manifest-freenove-s3-40mhz.json
+          cp web-flasher/manifest-freenove-s3-35.json _site/manifest-freenove-s3-35.json
+          cp web-flasher/manifest-crowpanel7.json _site/manifest-crowpanel7.json
+          cp web-flasher/manifest-sticks3.json _site/manifest-sticks3.json
+          cp web-flasher/manifest-cardputer-adv.json _site/manifest-cardputer-adv.json
+          cp web-flasher/manifest-nm-cyd-c5.json _site/manifest-nm-cyd-c5.json
+          cp web-flasher/manifest-marauder-v8.json _site/manifest-marauder-v8.json
+          cp web-flasher/manifest-tdeck-plus.json _site/manifest-tdeck-plus.json
+          # A LAB RUN MUST NOT CHANGE WHAT THE PUBLIC PAGE SERVES.
+          #
+          # A Pages deploy is wholesale -- there is no partial update -- so a
+          # lab run republishes the entire site whether it means to or not.
+          # The first one shipped this build's normal-board binaries, which
+          # are master HEAD rather than the release, and stamped every
+          # manifest lab-<sha>. Somebody arriving for the released firmware
+          # got an unreleased build labelled with a commit.
+          #
+          # So the root site is restored from the latest release first, and
+          # only then does the lab build get added alongside it. The lab
+          # firmware is the sole thing this run contributes.
+          if [ "${{ steps.ver.outputs.is_lab }}" = "true" ]; then
+            LATEST="$(gh release list --limit 1 --json tagName -q '.[0].tagName')"
+            if [ -z "$LATEST" ]; then
+              echo "::error::No release to restore the root site from."
+              exit 1
+            fi
+            echo "Restoring root site from $LATEST"
+            export LATEST
+            # esp32s3-* and *-partitions.bin too: the watch's own bootloader
+            # and table are named differently from the shared ESP32 pair, and
+            # without them every lab run left the public watch install 404ing
+            # on two of its four files (v1.20.0 until this was caught).
+            # esp32c5-* for the same reason: the C5's bootloader and boot_app0
+            # were not in the list, and the first lab run after v1.28.0 failed
+            # the check below instead of deploying a C5 install with two 404s.
+            gh release download "$LATEST" -D _site --clobber \
+              -p '*-firmware.bin' -p 'manifest-*.json' -p 'esp32-*.bin' -p 'esp32s3-*.bin' -p 'esp32c5-*.bin' \
+              -p '*-partitions.bin' -p '*-bootloader.bin' -p '*-firmware.sig' || true
+            # Every file a restored public manifest names must be here, or the
+            # public page 404s on it. Fail the run rather than deploy that.
+            python - <<'PY'
+          import json, glob, os, re, subprocess, sys
+          # A board added to master since the release has a public manifest
+          # from web-flasher/ but nothing in the release behind it. A lab run
+          # cannot publish it, so it comes off the public page -- manifest
+          # and <option> -- until the next release carries it. A manifest the
+          # release DID ship is held to every file, below.
+          latest = os.environ["LATEST"]
+          shipped = set(subprocess.run(["gh", "release", "view", latest, "-R", os.environ["GITHUB_REPOSITORY"], "--json", "assets", "-q", ".assets[].name"],
+                                       capture_output=True, text=True, check=True).stdout.split())
+          # next.html (the three-step layout under review) gets the same pruning.
+          pages = {f: open(f, encoding="utf-8").read() for f in ("_site/index.html", "_site/next.html") if os.path.exists(f)}
+          for mf in glob.glob("_site/manifest-*.json"):
+              name = os.path.basename(mf)
+              if name.startswith("manifest-lab-") or name in shipped:
+                  continue
+              os.remove(mf)
+              n = 0
+              for f in pages:
+                  pages[f], k = re.subn(r'[ \t]*<option value="\./' + re.escape(name) + r'"[^\n]*</option>\n', "", pages[f])
+                  n += k
+              print("::notice::%s is not in %s yet: off the public page until a release carries it (%d option removed)" % (name, latest, n))
+          for f, page in pages.items():
+              open(f, "w", encoding="utf-8").write(page)
+          missing = []
+          for mf in glob.glob("_site/manifest-*.json"):
+              if os.path.basename(mf).startswith("manifest-lab-"):
+                  continue
+              for b in json.load(open(mf))["builds"]:
+                  for part in b["parts"]:
+                      if not os.path.exists(os.path.join("_site", part["path"])):
+                          missing.append(os.path.basename(mf) + " -> " + part["path"])
+          if missing:
+              print("::error::The restored public site is missing files:\n" + "\n".join(missing))
+              sys.exit(1)
+          print("restored public manifests: every file present")
+          PY
+            # This run's build, under lab- names beside the release, with a
+            # manifest each that points at them. web-flasher/index.html's
+            # ?lab=1 list is what offers them.
+            python - <<'PY'
+          import json, shutil, os
+          label = "${{ steps.ver.outputs.label }}"
+          ver   = "${{ steps.ver.outputs.version }}"
+          for board in ("cyd", "cyd-ili9341", "cyd-fast", "cyd-ili9341-fast", "cyd35-fast", "cyd35c-fast", "rlphantom-r", "freenove32", "cyd32c", "twatch-s3", "freenove-s3", "freenove-s3-40mhz", "freenove-s3-35", "crowpanel7", "nm-cyd-c5", "marauder-v8", "tdeck-plus", "sticks3", "cardputer-adv", "tab5"):
+              # The C5s and the Tab5 come from their own runner and may not have come at all.
+              if not os.path.exists(board + "-firmware.bin"):
+                  print("::warning::no %s build this run; not in the lab list" % board)
+                  continue
+              shutil.copy(board + "-firmware.bin", "_site/lab-" + board + "-firmware.bin")
+              if os.path.exists(board + "-firmware.sig"):
+                  shutil.copy(board + "-firmware.sig", "_site/lab-" + board + "-firmware.sig")
+              m = json.load(open("web-flasher/manifest-" + board + ".json"))
+              m["name"] = "LAB " + label + " -- " + m["name"]
+              m["version"] = ver
+              for b in m["builds"]:
+                  for part in b["parts"]:
+                      # The shared ESP32 bootloader, table and otadata come from
+                      # the restored release. Anything else a lab board needs --
+                      # its firmware, or the S3 watch's own bootloader and
+                      # table -- comes from THIS build, under a lab- name, so a
+                      # release that never carried the board still serves it.
+                      if part["path"].startswith("esp32-"):
+                          continue
+                      shutil.copy(part["path"], "_site/lab-" + part["path"])
+                      part["path"] = "lab-" + part["path"]
+              json.dump(m, open("_site/manifest-lab-" + board + ".json", "w"), indent=2)
+          print("lab boards added:", label, ver)
+          PY
+            echo "root site restored from $LATEST; lab build $LATEST + ${{ steps.ver.outputs.version }}"
+          fi
+          # One shared bootloader and partition table (see the build step
+          # for why that is safe and how it is enforced), then one app per
+          # variant. Every manifest points at the same two shared files.
+          # On a lab run these stay what the restore put there: this loop
+          # used to run regardless and put master's binaries under the
+          # release's manifests, which is the exact thing the restore above
+          # was written to prevent.
+          if [ "${{ steps.ver.outputs.is_lab }}" != "true" ]; then
+            cp esp32-bootloader.bin _site/esp32-bootloader.bin
+            cp esp32-partitions.bin _site/esp32-partitions.bin
+            cp esp32-otadata.bin    _site/esp32-otadata.bin
+            cp esp32s3-bootloader.bin  _site/esp32s3-bootloader.bin
+            cp twatch-s3-partitions.bin _site/twatch-s3-partitions.bin
+            cp sticks3-bootloader.bin sticks3-partitions.bin cardputer-adv-bootloader.bin cardputer-adv-partitions.bin _site/
+            # Every board in the picker needs BOTH its manifest above and its
+            # firmware here: v1.16.0 shipped cyd35-fast to the release and into
+            # index.html's <option> list but neither into _site, so the 3.5"
+            # appeared in the picker and 404'd when chosen.
+            for board in cyd cyd-ili9341 awok rlphantom-r freenove32 cyd32c cyd-fast cyd-ili9341-fast cyd35-fast cyd35c-fast twatch-s3 freenove-s3 freenove-s3-40mhz freenove-s3-35 crowpanel7 tdeck-plus sticks3 cardputer-adv; do
+              cp "$board-firmware.bin" "_site/$board-firmware.bin"
+              # The Bluetooth update page fetches the image and its signature
+              # side by side from the site root.
+              if [ -f "$board-firmware.sig" ]; then cp "$board-firmware.sig" "_site/$board-firmware.sig"; fi
+            done
+            # The NM-CYD-C5 (ESP32-C5) when its own runner built it (see
+            # build-c5): its own bootloader, table and boot_app0 beside its
+            # firmware, nothing shared with the boards above. Without a build
+            # its manifest and its <option> come off THIS release's page,
+            # rather than sit in the picker and 404 when chosen.
+            if [ -f nm-cyd-c5-firmware.bin ]; then
+              cp nm-cyd-c5-firmware.bin nm-cyd-c5-partitions.bin esp32c5-bootloader.bin esp32c5-boot_app0.bin _site/
+            else
+              rm -f _site/manifest-nm-cyd-c5.json
+              python3 - <<'PY'
+          import re
+          p = open("_site/index.html", encoding="utf-8").read()
+          p, n = re.subn(r'[ \t]*<option value="\./manifest-nm-cyd-c5\.json"[^\n]*</option>\n', "", p)
+          open("_site/index.html", "w", encoding="utf-8").write(p)
+          print("::warning::no NM-CYD-C5 build this run: its option is off the page (%d removed)" % n)
+          PY
+            fi
+            # The Marauder V8, the same way: its own three files and the
+            # C5's boot_app0, or off this release's page.
+            if [ -f marauder-v8-firmware.bin ]; then
+              cp marauder-v8-firmware.bin marauder-v8-bootloader.bin marauder-v8-partitions.bin esp32c5-boot_app0.bin _site/
+            else
+              rm -f _site/manifest-marauder-v8.json
+              python3 - <<'PY'
+          import re
+          p = open("_site/index.html", encoding="utf-8").read()
+          p, n = re.subn(r'[ \t]*<option value="\./manifest-marauder-v8\.json"[^\n]*</option>\n', "", p)
+          open("_site/index.html", "w", encoding="utf-8").write(p)
+          print("::warning::no Marauder V8 build this run: its option is off the page (%d removed)" % n)
+          PY
+            fi
+          fi
+          mkdir -p _site/update
+          cp web-flasher/update/index.html _site/update/index.html
+          # The browser emulator: this firmware compiled to WebAssembly,
+          # so the site can offer "try it" next to "flash it".
+          #
+          # It is BUILT HERE on a tag, from the tag's own sources -- see the
+          # "Build the browser emulator" step above. It used to be a committed
+          # artifact that only refreshed when somebody remembered to run
+          # `make wasm` before tagging, and that safeguard failed twice: once
+          # at v1.5.8 (owned up to in the v1.5.9 notes) and again at v1.7.0,
+          # which shipped v1.6.0's emulator. A check that depends on a person
+          # remembering is not a check.
+          #
+          # The committed copy in web-flasher/emulator/ stays: it is what a lab
+          # run serves and what somebody can open locally without emsdk. It is
+          # just no longer what the public page gets on a release.
+          #
+          # The README's demo.gif has no such excuse any more. Its
+          # renderer needs nothing but g++ and the sources already here --
+          # see sim/make_demo.py.
+          mkdir -p _site/emulator
+          # A lab run serves the RELEASED emulator, for the same reason it
+          # serves the released firmware: master's is built from unreleased
+          # features, and the emulator is the public page's "try it". So it
+          # is the release tag's page and a build of the tag's own sources.
+          if [ "${{ steps.ver.outputs.is_lab }}" = "true" ]; then
+            # Built from the release tag's sources by the compile step above.
+            # Not the tag's committed web-flasher/emulator/ files: those went
+            # stale at v1.12.0 and served a v1.7 emulator for weeks.
+            cp released-emulator/index.html released-emulator/squachsim.js released-emulator/squachsim.wasm _site/emulator/
+            cp released-emulator/squachsim-*.* _site/emulator/ 2>/dev/null || true
+            echo "emulator rebuilt from $LATEST's sources"
+          else
+            # index.html is hand-written and not a build product, so it always
+            # comes from the tree. The two build products come from the build
+            # step, which has just compiled them from this tag's sources.
+            cp web-flasher/emulator/index.html _site/emulator/index.html
+            cp sim/web/squachsim.js            _site/emulator/squachsim.js
+            cp sim/web/squachsim.wasm          _site/emulator/squachsim.wasm
+            # The boards' own builds (the T-Deck's keyboard and LORA page, the
+            # watch's screens, the Cardputer's cursor), each loaded by the page
+            # the first time somebody picks that board.
+            for b in tdeck twatch cardputer; do
+              cp "sim/web/squachsim-$b.js" "sim/web/squachsim-$b.wasm" _site/emulator/
+            done
+            # Loud, because a silent mismatch here is the whole bug this step
+            # exists to stop.
+            if ! cmp -s sim/web/squachsim.wasm web-flasher/emulator/squachsim.wasm; then
+              echo "::notice::the committed emulator differs from this tag's build -- the site serves the freshly built one"
+            fi
+          fi
+
+      - name: Keep the previous two releases flashable
+        # Runs on lab builds too. Skipping it was a mistake with a live
+        # consequence: this step is what writes versions.json and the
+        # per-release directories the flasher's version dropdown reads, and
+        # a lab deploy without it 404'd both. The history here belongs to the
+        # RELEASES -- it has nothing to do with what triggered the run.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          # A lab run has no release tag of its own -- TAG is the branch name.
+          # The root site it serves was restored from the latest release, so
+          # that release is what "latest" means here. Without this the public
+          # version picker read "master (latest)" after the 2026-09-12 lab run.
+          if [ "${{ steps.ver.outputs.is_lab }}" = "true" ]; then
+            TAG="$(gh release list --limit 1 --json tagName -q '.[0].tagName')"
+          fi
+          # Release assets carry no CORS headers, so a browser cannot fetch
+          # them from the Releases tab -- everything the flasher touches has
+          # to be same-origin on Pages. And a Pages deploy replaces the whole
+          # site, so older builds only stay reachable if this run puts them
+          # back. CI downloads them server-side, where CORS does not apply.
+          #
+          # Two previous versions is the point where this stops being free.
+          # A retained release costs whatever that release shipped: seven
+          # binaries from v1.5.17 onward, fifteen for anything older, since
+          # those predate the shared esp32-bootloader/partitions pair.
+          PREV=$(gh release list --limit 12 --json tagName -q '.[].tagName' \
+                 | grep -v "^${TAG}$" | head -2)
+          for tag in $PREV; do
+            mkdir -p "_site/$tag"
+            # The manifests are release assets too, already stamped with
+            # that release's version, and they name the same relative
+            # paths -- so dropping a manifest into its own release's
+            # directory resolves to that release's binaries with no
+            # rewriting at all.
+            gh release download "$tag" -D "_site/$tag" \
+              -p '*-bootloader.bin' -p '*-partitions.bin' \
+              -p '*-firmware.bin' -p 'manifest-*.json' -p 'esp32c5-boot_app0.bin' \
+              || echo "::warning::could not fetch $tag; skipping it"
+            # Releases from before Bluetooth updates have no otadata part in
+            # their manifests. Rolling back to one over USB must still take
+            # effect on a board that has updated since, so give them this
+            # release's (it is identical in every build) and add the part.
+            cp esp32-otadata.bin "_site/$tag/esp32-otadata.bin"
+            python3 - "$tag" <<'PY'
+          import glob, json, sys
+          for p in glob.glob("_site/%s/manifest-*.json" % sys.argv[1]):
+              m = json.load(open(p))
+              parts = m["builds"][0]["parts"]
+              if not any(x["path"] == "esp32-otadata.bin" for x in parts):
+                  parts.append({"path": "esp32-otadata.bin", "offset": 57344})
+                  json.dump(m, open(p, "w"), indent=2)
+          PY
+          done
+
+          # What the flasher offers in its version picker. Written as a
+          # file rather than inlined into index.html so the page stays a
+          # static asset that does not need regenerating.
+          {
+            echo '{'
+            echo "  \"latest\": \"${TAG}\","
+            echo '  "versions": ['
+            echo "    { \"tag\": \"${TAG}\", \"dir\": \"\" }"
+            for tag in $PREV; do
+              if [ -f "_site/$tag/manifest-cyd.json" ]; then
+                echo "    ,{ \"tag\": \"$tag\", \"dir\": \"$tag/\" }"
+              fi
+            done
+            echo '  ]'
+            echo '}'
+          } > _site/versions.json
+          cat _site/versions.json
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

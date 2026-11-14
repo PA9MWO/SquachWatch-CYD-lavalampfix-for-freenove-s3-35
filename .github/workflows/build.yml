@@ -1,0 +1,142 @@
+# Builds every commit, which nothing did before this existed.
+#
+# release-flasher.yml only triggers on a v*.*.* tag, so the first thing that
+# ever compiled master was the release itself. A broken commit stayed
+# invisible until someone cut a tag, and then it surfaced as a FAILED
+# RELEASE -- the worst possible place to find out, because the tag is
+# already public by then and has to be deleted and re-pushed.
+#
+# This is deliberately not a copy of the release job. It builds and stops:
+# no merged images, no manifests, no Pages deploy, no release. Just the
+# question "does this still compile", answered in about two minutes.
+name: Build
+
+on:
+  push:
+    branches: [master]
+    # Documentation and release notes cannot break a build, and the tag
+    # workflow covers the release path already.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/release-notes/**'
+  pull_request:
+  workflow_dispatch: {}
+
+# A second push to master supersedes the first: there is no point finishing
+# a build for a commit that is already two behind.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'   # pioarduino refuses newer (3.15, 2026-10-20)
+
+      # Both caches matter: the toolchain is a ~200MB download and the
+      # framework another large unpack, and neither changes between runs.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      # The three that ship, which is what `pio run` with no -e does --
+      # cyd35 is excluded on purpose (see platformio.ini: it is frozen and
+      # boot loops on hardware, so a green build here would mean nothing)
+      # and the two -fast variants differ from their base build by one
+      # -D flag, so they cannot break independently of it.
+      - name: Build
+        run: pio run
+
+      # Compile the opt-in board without adding it to release publishing.
+      - name: Build Elecrow CrowPanel Advance 7.0
+        run: pio run -e crowpanel7
+
+      # Same idea for the NM-CYD-C5, with one difference worth knowing: it is
+      # the only environment on a different platform (Arduino 3.3 / IDF 5.5,
+      # because the ESP32-C5 did not exist when core 2.0.14 was cut), so this
+      # step downloads a second toolchain -- a RISC-V one -- that no other job
+      # here needs. It is cached with the rest under the platformio.ini hash,
+      # so it is a cold-cache cost rather than a per-run one. Drop this step if
+      # that is not worth it; the board is opt-in either way.
+      - name: Build RockBase NM-CYD-C5 (ESP32-C5)
+        run: pio run -e nm-cyd-c5
+
+      # The Marauder V8: the same C5 platform, so no new toolchain.
+      - name: Build Marauder V8 (ESP32-C5)
+        run: pio run -e marauder-v8
+
+      # The Waveshare ESP32-C5-Touch-LCD-2.8: the same C5 platform again.
+      - name: Build Waveshare ESP32-C5-Touch-LCD-2.8 (ESP32-C5)
+        run: pio run -e waveshare-c5-28
+
+      # The LilyGo T-Deck Plus: an S3 like the watch, on the ordinary platform.
+      - name: Build LilyGo T-Deck Plus (ESP32-S3)
+        run: pio run -e tdeck-plus
+
+      # The Freenove ESP32-S3 2.8" at 40 MHz, for panels that tear at 80.
+      # Packaged as one image, flashed at 0x0, so it can be tested on
+      # hardware before it goes on the flasher.
+      - name: Build Freenove ESP32-S3 2.8" at 40 MHz
+        run: |
+          pio run -e freenove-s3-40mhz
+          pip install esptool
+          python -m esptool --chip esp32s3 merge_bin \
+            -o firmware-freenove-s3-40mhz-merged.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            0x0     .pio/build/freenove-s3-40mhz/bootloader.bin \
+            0x8000  .pio/build/freenove-s3-40mhz/partitions.bin \
+            0xe000  "$HOME/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin" \
+            0x10000 .pio/build/freenove-s3-40mhz/firmware.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-freenove-s3-40mhz
+          path: firmware-freenove-s3-40mhz-merged.bin
+
+  tests:
+    # The decoders are pure arithmetic over byte buffers, so they run on a
+    # desktop with no board and no display. Worth a job of their own: the
+    # failure mode they cover is a wrong offset producing a plausible
+    # coordinate rather than a crash, which no amount of compiling catches.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run host tests
+        run: make -C test
+
+      # Costs a second and needs no toolchain. The failure it covers is a
+      # scan quietly going back to active -- which compiles, runs, finds
+      # networks, and transmits a probe request on every channel while the
+      # FAQ tells people the WiFi side only listens.
+      - name: Check no WiFi scan transmits
+        run: tools/check_emissions.sh
+
+  emulator:
+    # Cheap, and it catches the failure mode the merge introduced: the
+    # emulator compiles the firmware's own sources against its shims, so a
+    # change to a header signature breaks it here rather than the next time
+    # somebody tries to render the README animation.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the PC emulator
+        run: make -C sim -j"$(nproc)"
+      - name: Render one frame
+        run: |
+          cd sim
+          ./squachsim clear /tmp/smoke.png --bg 7 --outfit 13 --frames 60
+          test -s /tmp/smoke.png
